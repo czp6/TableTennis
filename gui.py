@@ -12,6 +12,10 @@ import threading
 from pathlib import Path
 from spin_tracker import SpinTracker, SpinData
 from trajectory_analyzer import TrajectoryAnalyzer
+from professional_video_loader import ProfessionalVideoLoader
+from pose_comparison import PoseComparison
+from gemini_coach import GeminiCoach
+from session_manager import SessionManager
 
 
 class SpinTrackerGUI:
@@ -28,10 +32,23 @@ class SpinTrackerGUI:
         self.is_playing = False
         self.current_frame_idx = 0
         self.processed_data = []
-        self.analysis_mode = "spin"  # "spin" or "trajectory"
+        self.analysis_mode = "spin"  # "spin", "trajectory", or "player"
         self.needs_rotation = True  # Rotate 90 degrees clockwise
         self.zoom_enabled = False  # Zoom to ball region
         self.zoom_margin = 3.0  # Multiplier for ball radius to determine crop size
+
+        # Professional comparison
+        self.pro_video_loader = ProfessionalVideoLoader()
+        self.pose_comparison = PoseComparison()
+        self.professional_data = None
+        self.comparison_results = None
+
+        # AI coaching
+        self.gemini_coach = GeminiCoach()
+        self.coaching_feedback = None
+
+        # Session management
+        self.session_manager = SessionManager()
 
         self.setup_ui()
 
@@ -63,12 +80,21 @@ class SpinTrackerGUI:
         mode_combo = ttk.Combobox(
             control_frame,
             textvariable=self.mode_var,
-            values=["spin", "trajectory"],
+            values=["spin", "trajectory", "player"],
             state="readonly",
             width=12
         )
         mode_combo.pack(side=tk.LEFT, padx=5)
         mode_combo.bind("<<ComboboxSelected>>", self.on_mode_change)
+
+        # Process only current mode checkbox
+        self.process_mode_only_var = tk.BooleanVar(value=False)
+        mode_only_check = ttk.Checkbutton(
+            control_frame,
+            text="Process Mode Only",
+            variable=self.process_mode_only_var
+        )
+        mode_only_check.pack(side=tk.LEFT, padx=5)
 
         # Zoom toggle
         self.zoom_var = tk.BooleanVar(value=False)
@@ -195,6 +221,195 @@ class SpinTrackerGUI:
         # Trajectory analysis tab
         trajectory_tab = ttk.Frame(self.notebook)
         self.notebook.add(trajectory_tab, text="Trajectory Analysis")
+
+        # Player tracking tab
+        player_tab = ttk.Frame(self.notebook)
+        self.notebook.add(player_tab, text="Player Tracking")
+
+        # Professional comparison tab
+        comparison_tab = ttk.Frame(self.notebook)
+        self.notebook.add(comparison_tab, text="Pro Comparison")
+
+        # AI coaching tab
+        coaching_tab = ttk.Frame(self.notebook)
+        self.notebook.add(coaching_tab, text="AI Coaching")
+
+        # Pose visualization controls
+        pose_viz_frame = ttk.LabelFrame(player_tab, text="Visualization", padding="10")
+        pose_viz_frame.pack(fill=tk.X, pady=5)
+
+        self.show_skeleton_var = tk.BooleanVar(value=True)
+        skeleton_check = ttk.Checkbutton(
+            pose_viz_frame,
+            text="Show Skeleton Overlay",
+            variable=self.show_skeleton_var
+        )
+        skeleton_check.pack(anchor=tk.W)
+
+        self.show_keypoint_conf_var = tk.BooleanVar(value=False)
+        keypoint_conf_check = ttk.Checkbutton(
+            pose_viz_frame,
+            text="Show Keypoint Confidence",
+            variable=self.show_keypoint_conf_var
+        )
+        keypoint_conf_check.pack(anchor=tk.W)
+
+        self.track_multiple_people_var = tk.BooleanVar(value=False)
+        multi_people_check = ttk.Checkbutton(
+            pose_viz_frame,
+            text="Track Multiple People",
+            variable=self.track_multiple_people_var
+        )
+        multi_people_check.pack(anchor=tk.W)
+
+        self.highlight_dominant_hand_var = tk.BooleanVar(value=True)
+        dominant_hand_check = ttk.Checkbutton(
+            pose_viz_frame,
+            text="Highlight Right Hand (Dominant)",
+            variable=self.highlight_dominant_hand_var
+        )
+        dominant_hand_check.pack(anchor=tk.W)
+
+        # Detection statistics frame
+        stats_frame = ttk.LabelFrame(player_tab, text="Detection Statistics", padding="10")
+        stats_frame.pack(fill=tk.X, pady=5)
+
+        self.detection_rate_label = ttk.Label(stats_frame, text="Detection Rate: --")
+        self.detection_rate_label.pack(anchor=tk.W)
+
+        self.active_model_label = ttk.Label(stats_frame, text="Active Model: --")
+        self.active_model_label.pack(anchor=tk.W)
+
+        # Update model name if tracker is available
+        if hasattr(self, 'tracker') and self.tracker and hasattr(self.tracker, 'pose_detector'):
+            if hasattr(self.tracker.pose_detector, 'get_active_model_name'):
+                model_name = self.tracker.pose_detector.get_active_model_name()
+                self.active_model_label.config(text=f"Active Model: {model_name}")
+            else:
+                self.active_model_label.config(text="Active Model: YOLOv8m-pose")
+
+        self.avg_confidence_label = ttk.Label(stats_frame, text="Avg Confidence: --")
+        self.avg_confidence_label.pack(anchor=tk.W)
+
+        ttk.Label(pose_viz_frame, text="Pose Confidence Threshold:").pack(anchor=tk.W, pady=(10, 0))
+        self.pose_conf_var = tk.DoubleVar(value=0.2)
+        pose_conf_slider = ttk.Scale(
+            pose_viz_frame,
+            from_=0.1,
+            to=0.5,
+            orient=tk.HORIZONTAL,
+            variable=self.pose_conf_var,
+            command=self.on_pose_param_change
+        )
+        pose_conf_slider.pack(fill=tk.X, pady=2)
+        self.pose_conf_label = ttk.Label(pose_viz_frame, text="0.20")
+        self.pose_conf_label.pack(anchor=tk.W)
+
+        # Current pose metrics
+        pose_metrics_frame = ttk.LabelFrame(player_tab, text="Current Pose Metrics", padding="10")
+        pose_metrics_frame.pack(fill=tk.X, pady=5)
+
+        self.stance_width_label = ttk.Label(pose_metrics_frame, text="Stance Width: --")
+        self.stance_width_label.pack(anchor=tk.W)
+
+        self.arm_extension_label = ttk.Label(pose_metrics_frame, text="Arm Extension: --")
+        self.arm_extension_label.pack(anchor=tk.W)
+
+        self.body_rotation_label = ttk.Label(pose_metrics_frame, text="Body Rotation: --")
+        self.body_rotation_label.pack(anchor=tk.W)
+
+        self.knee_bend_label = ttk.Label(pose_metrics_frame, text="Knee Bend: --")
+        self.knee_bend_label.pack(anchor=tk.W)
+
+        self.stroke_phase_label = ttk.Label(pose_metrics_frame, text="Stroke Phase: --", font=("Arial", 12, "bold"))
+        self.stroke_phase_label.pack(anchor=tk.W, pady=(10, 0))
+
+        # Pose data export
+        pose_export_frame = ttk.Frame(player_tab)
+        pose_export_frame.pack(fill=tk.X, pady=10)
+
+        ttk.Button(
+            pose_export_frame,
+            text="Export Pose Data",
+            command=self.export_pose_data
+        ).pack(side=tk.LEFT, padx=5)
+
+        # Professional comparison controls
+        pro_select_frame = ttk.LabelFrame(comparison_tab, text="Professional Player", padding="10")
+        pro_select_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(pro_select_frame, text="Select Professional:").pack(anchor=tk.W)
+        self.pro_player_var = tk.StringVar(value="Ma Long")
+        pro_combo = ttk.Combobox(
+            pro_select_frame,
+            textvariable=self.pro_player_var,
+            values=["Ma Long", "Fan Zhendong", "Custom..."],
+            state="readonly",
+            width=20
+        )
+        pro_combo.pack(fill=tk.X, pady=5)
+
+        ttk.Button(
+            pro_select_frame,
+            text="Load Professional Video",
+            command=self.load_professional_video
+        ).pack(fill=tk.X, pady=5)
+
+        ttk.Button(
+            pro_select_frame,
+            text="Compare with Professional",
+            command=self.compare_with_professional
+        ).pack(fill=tk.X, pady=5)
+
+        # Comparison results
+        comparison_results_frame = ttk.LabelFrame(comparison_tab, text="Comparison Results", padding="10")
+        comparison_results_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.comparison_text = tk.Text(comparison_results_frame, height=15, wrap=tk.WORD)
+        self.comparison_text.pack(fill=tk.BOTH, expand=True)
+
+        # AI coaching controls
+        coaching_controls_frame = ttk.LabelFrame(coaching_tab, text="Generate Feedback", padding="10")
+        coaching_controls_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(
+            coaching_controls_frame,
+            text="Generate AI Coaching Feedback",
+            command=self.generate_coaching_feedback
+        ).pack(fill=tk.X, pady=5)
+
+        ttk.Label(coaching_controls_frame, text="Focus on top N areas:").pack(anchor=tk.W, pady=(10, 0))
+        self.coaching_focus_var = tk.IntVar(value=3)
+        coaching_focus_spin = ttk.Spinbox(
+            coaching_controls_frame,
+            from_=1,
+            to=5,
+            textvariable=self.coaching_focus_var,
+            width=10
+        )
+        coaching_focus_spin.pack(anchor=tk.W, pady=5)
+
+        # Coaching feedback display
+        coaching_feedback_frame = ttk.LabelFrame(coaching_tab, text="Coaching Feedback", padding="10")
+        coaching_feedback_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.coaching_text = tk.Text(coaching_feedback_frame, height=20, wrap=tk.WORD)
+        self.coaching_text.pack(fill=tk.BOTH, expand=True)
+
+        coaching_export_frame = ttk.Frame(coaching_tab)
+        coaching_export_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(
+            coaching_export_frame,
+            text="Export Coaching Report",
+            command=self.export_coaching_report
+        ).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(
+            coaching_export_frame,
+            text="Save Session",
+            command=self.save_session
+        ).pack(side=tk.LEFT, padx=5)
 
         # Detection parameters tab with scrollbar
         params_tab = ttk.Frame(self.notebook)
@@ -615,14 +830,16 @@ class SpinTrackerGUI:
         cap.release()
 
     def on_mode_change(self, event=None):
-        """Handle mode change between spin and trajectory."""
+        """Handle mode change between spin, trajectory, and player tracking."""
         self.analysis_mode = self.mode_var.get()
 
         # Switch to appropriate notebook tab
         if self.analysis_mode == "spin":
             self.notebook.select(0)
-        else:
+        elif self.analysis_mode == "trajectory":
             self.notebook.select(1)
+        elif self.analysis_mode == "player":
+            self.notebook.select(2)
 
         # Refresh display if video is processed
         if self.processed_data and self.tracker:
@@ -631,6 +848,18 @@ class SpinTrackerGUI:
     def on_zoom_toggle(self):
         """Handle zoom toggle."""
         self.zoom_enabled = self.zoom_var.get()
+
+    def on_pose_param_change(self, event=None):
+        """Handle pose parameter changes."""
+        self.pose_conf_label.config(text=f"{self.pose_conf_var.get():.2f}")
+
+        # Update tracker parameters if tracker exists
+        if self.tracker:
+            self.tracker.pose_conf_threshold = self.pose_conf_var.get()
+
+            # Refresh current frame if video is loaded
+            if self.processed_data:
+                self.show_frame(self.current_frame_idx)
 
     def on_param_change(self, event=None):
         """Handle detection parameter changes in real-time."""
@@ -742,11 +971,25 @@ class SpinTrackerGUI:
     def _process_video_thread(self, fps):
         """Thread function for video processing."""
         try:
+            # Determine processing mode
+            process_mode = "all"
+            if self.process_mode_only_var.get():
+                process_mode = self.mode_var.get()
+                if process_mode == "spin":
+                    process_mode = "ball"  # Spin mode needs ball detection
+                elif process_mode == "trajectory":
+                    process_mode = "ball"  # Trajectory mode needs ball detection
+
             self.tracker = SpinTracker(
                 self.video_path,
                 fps=fps,
-                rotate_90_cw=self.rotation_var.get()
+                rotate_90_cw=self.rotation_var.get(),
+                process_mode=process_mode
             )
+
+            # Set multi-person tracking flag
+            if hasattr(self.tracker, 'track_multiple_people'):
+                self.tracker.track_multiple_people = self.track_multiple_people_var.get()
             self.trajectory_analyzer = TrajectoryAnalyzer(fps=fps)
 
             # Rotate video based on user setting
@@ -804,6 +1047,14 @@ class SpinTrackerGUI:
         self.export_btn.config(state=tk.NORMAL)
         self.frame_slider.state(['!disabled'])
         self.frame_slider.config(to=self.tracker.frame_count - 1)
+
+        # Update active model label
+        if self.tracker and hasattr(self.tracker, 'pose_detector'):
+            if hasattr(self.tracker.pose_detector, 'get_active_model_name'):
+                model_name = self.tracker.pose_detector.get_active_model_name()
+                self.active_model_label.config(text=f"Active Model: {model_name}")
+            else:
+                self.active_model_label.config(text="Active Model: YOLOv8m-pose")
 
         # Update statistics
         self.update_statistics()
@@ -908,8 +1159,10 @@ class SpinTrackerGUI:
         # Draw annotations based on mode
         if self.analysis_mode == "spin":
             frame = self._draw_spin_annotations(frame, spin_data, crop_offset)
-        else:  # trajectory mode
+        elif self.analysis_mode == "trajectory":
             frame = self._draw_trajectory_annotations(frame, frame_idx, spin_data, crop_offset)
+        elif self.analysis_mode == "player":
+            frame = self._draw_player_annotations(frame, spin_data, crop_offset)
 
         self.display_frame(frame)
         self.frame_label.config(text=f"Frame: {frame_idx}/{self.tracker.frame_count}")
@@ -1247,6 +1500,264 @@ class SpinTrackerGUI:
 
         return frame
 
+    def _draw_player_annotations(self, frame, spin_data, crop_offset=(0, 0)):
+        """Draw player pose annotations on frame."""
+        offset_x, offset_y = crop_offset
+
+        # Draw multiple people if enabled
+        if self.track_multiple_people_var.get() and self.tracker and hasattr(self.tracker, 'multi_pose_data_history'):
+            frame_idx = spin_data.frame_number if spin_data else 0
+            if frame_idx < len(self.tracker.multi_pose_data_history):
+                poses = self.tracker.multi_pose_data_history[frame_idx]
+                if self.show_skeleton_var.get():
+                    for i, pose in enumerate(poses):
+                        # Use different colors for different people
+                        person_color_offset = i * 60  # Hue shift
+                        frame = self._draw_skeleton(frame, pose, offset_x, offset_y, person_id=i)
+
+        # Draw primary person
+        if not spin_data or not spin_data.pose_keypoints:
+            return frame
+
+        pose = spin_data.pose_keypoints
+
+        # Draw skeleton if enabled (and not already drawn in multi-person mode)
+        if self.show_skeleton_var.get() and not self.track_multiple_people_var.get():
+            frame = self._draw_skeleton(frame, pose, offset_x, offset_y)
+
+        # Draw keypoint confidence if enabled
+        if self.show_keypoint_conf_var.get():
+            frame = self._draw_keypoint_confidence(frame, pose, offset_x, offset_y)
+
+        # Update pose metrics labels
+        if spin_data.pose_metrics:
+            metrics = spin_data.pose_metrics
+            self.stance_width_label.config(text=f"Stance Width: {metrics.stance_width:.1f} px")
+            self.arm_extension_label.config(text=f"Arm Extension: {metrics.arm_extension:.1f} px")
+            self.body_rotation_label.config(text=f"Body Rotation: {metrics.body_rotation:.1f}°")
+            self.knee_bend_label.config(text=f"Knee Bend: {metrics.knee_bend:.1f}°")
+            self.stroke_phase_label.config(text=f"Stroke Phase: {metrics.stroke_phase.value}")
+
+        # Update detection statistics
+        if self.tracker and hasattr(self.tracker, 'pose_detection_attempts'):
+            if self.tracker.pose_detection_attempts > 0:
+                raw_rate = self.tracker.pose_detection_successes / self.tracker.pose_detection_attempts
+                total_poses = self.tracker.pose_detection_successes + getattr(self.tracker, 'pose_interpolated_frames', 0)
+                effective_rate = total_poses / self.tracker.pose_detection_attempts
+
+                self.detection_rate_label.config(
+                    text=f"Detection: {raw_rate:.1%} raw, {effective_rate:.1%} effective"
+                )
+
+                # Calculate average confidence from detected poses
+                if spin_data.pose_keypoints:
+                    valid_keypoints = spin_data.pose_keypoints.keypoints[spin_data.pose_keypoints.keypoints[:, 2] > 0.25]
+                    if len(valid_keypoints) > 0:
+                        avg_conf = valid_keypoints[:, 2].mean()
+
+                        # Show tracking quality if available
+                        if hasattr(self.tracker, 'pose_tracker') and self.tracker.pose_tracker:
+                            quality = self.tracker.pose_tracker.get_tracking_quality()
+                            self.avg_confidence_label.config(
+                                text=f"Avg Conf: {avg_conf:.2f} | Quality: {quality:.1%}"
+                            )
+                        else:
+                            self.avg_confidence_label.config(text=f"Avg Confidence: {avg_conf:.2f}")
+
+        return frame
+
+    def _draw_skeleton(self, frame, pose, offset_x, offset_y, person_id=0):
+        """Draw skeleton connections on frame with right hand highlighting."""
+        # COCO skeleton connections
+        skeleton = [
+            (5, 6),   # shoulders
+            (5, 7),   # left shoulder to elbow
+            (7, 9),   # left elbow to wrist
+            (6, 8),   # right shoulder to elbow
+            (8, 10),  # right elbow to wrist
+            (5, 11),  # left shoulder to hip
+            (6, 12),  # right shoulder to hip
+            (11, 12), # hips
+            (11, 13), # left hip to knee
+            (13, 15), # left knee to ankle
+            (12, 14), # right hip to knee
+            (14, 16)  # right knee to ankle
+        ]
+
+        # Right arm connections (for highlighting)
+        right_arm_connections = [(6, 8), (8, 10)]
+
+        # Color offset for multi-person tracking
+        hue_shift = person_id * 60
+
+        # Draw connections
+        for start_idx, end_idx in skeleton:
+            start_kp = pose.get_keypoint(start_idx)
+            end_kp = pose.get_keypoint(end_idx)
+
+            if start_kp and end_kp:
+                # Check confidence - lowered threshold for smoother display
+                conf = min(start_kp[2], end_kp[2])
+                if conf < 0.15:  # Even lower threshold for maximum continuity
+                    continue
+
+                # Adjust for crop offset
+                start_pt = (int(start_kp[0] - offset_x), int(start_kp[1] - offset_y))
+                end_pt = (int(end_kp[0] - offset_x), int(end_kp[1] - offset_y))
+
+                # Check if this is right arm (dominant hand)
+                is_right_arm = (start_idx, end_idx) in right_arm_connections
+                highlight_right = self.highlight_dominant_hand_var.get() if hasattr(self, 'highlight_dominant_hand_var') else True
+
+                # Color based on confidence and right arm highlighting
+                if is_right_arm and highlight_right:
+                    # Right arm gets special highlighting
+                    if conf > 0.7:
+                        color = (255, 0, 255)  # Magenta - high confidence right arm
+                    elif conf > 0.5:
+                        color = (255, 100, 255)  # Light magenta
+                    elif conf > 0.3:
+                        color = (200, 0, 200)  # Dark magenta
+                    else:
+                        color = (150, 0, 150)  # Very dark magenta
+                    thickness = 4  # Thicker for right arm
+                else:
+                    # Normal coloring for other connections
+                    if conf > 0.7:
+                        color = (0, 255, 0)  # Green - high confidence
+                    elif conf > 0.5:
+                        color = (0, 255, 255)  # Yellow - medium confidence
+                    elif conf > 0.3:
+                        color = (0, 165, 255)  # Orange - low confidence
+                    elif conf > 0.15:
+                        color = (128, 128, 255)  # Light red - interpolated/low confidence
+                    else:
+                        color = (0, 0, 255)  # Red - very low confidence
+                    thickness = 3 if conf > 0.5 else 2
+
+                # Apply hue shift for multi-person
+                if person_id > 0:
+                    color = self._shift_color_hue(color, hue_shift)
+
+                cv2.line(frame, start_pt, end_pt, color, thickness)
+
+        # Draw keypoints
+        for i in range(17):
+            kp = pose.get_keypoint(i)
+            if kp and kp[2] > 0.15:  # Lowered threshold
+                pt = (int(kp[0] - offset_x), int(kp[1] - offset_y))
+
+                # Check if this is right wrist (keypoint 10)
+                is_right_wrist = (i == 10)
+                highlight_right = self.highlight_dominant_hand_var.get() if hasattr(self, 'highlight_dominant_hand_var') else True
+
+                # Color and size based on confidence and right wrist
+                if is_right_wrist and highlight_right:
+                    # Right wrist gets special highlighting
+                    color = (255, 0, 255)  # Magenta
+                    radius = 8  # Larger for right wrist
+                else:
+                    # Normal coloring
+                    if kp[2] > 0.7:
+                        color = (0, 255, 0)  # Green
+                    elif kp[2] > 0.5:
+                        color = (0, 255, 255)  # Yellow
+                    elif kp[2] > 0.3:
+                        color = (0, 165, 255)  # Orange
+                    elif kp[2] > 0.15:
+                        color = (128, 128, 255)  # Light red - interpolated
+                    else:
+                        color = (0, 0, 255)  # Red
+                    radius = 5 if kp[2] > 0.5 else 4
+
+                # Apply hue shift for multi-person
+                if person_id > 0:
+                    color = self._shift_color_hue(color, hue_shift)
+
+                cv2.circle(frame, pt, radius, color, -1)
+
+                # Show confidence value if debug mode enabled
+                if self.show_keypoint_conf_var.get():
+                    cv2.putText(frame, f"{kp[2]:.2f}",
+                               (pt[0]+5, pt[1]-5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+
+        return frame
+
+    def _shift_color_hue(self, bgr_color, hue_shift):
+        """Shift BGR color by hue for multi-person visualization."""
+        # Convert BGR to HSV
+        bgr_array = np.uint8([[bgr_color]])
+        hsv = cv2.cvtColor(bgr_array, cv2.COLOR_BGR2HSV)
+
+        # Shift hue
+        hsv[0][0][0] = (hsv[0][0][0] + hue_shift) % 180
+
+        # Convert back to BGR
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        return tuple(map(int, bgr[0][0]))
+
+    def _draw_keypoint_confidence(self, frame, pose, offset_x, offset_y):
+        """Draw keypoint confidence values on frame."""
+        keypoint_names = [
+            "nose", "l_eye", "r_eye", "l_ear", "r_ear",
+            "l_shoulder", "r_shoulder", "l_elbow", "r_elbow",
+            "l_wrist", "r_wrist", "l_hip", "r_hip",
+            "l_knee", "r_knee", "l_ankle", "r_ankle"
+        ]
+
+        for i in range(17):
+            kp = pose.get_keypoint(i)
+            if kp and kp[2] > 0.3:
+                pt = (int(kp[0] - offset_x), int(kp[1] - offset_y))
+                text = f"{keypoint_names[i]}: {kp[2]:.2f}"
+
+                cv2.putText(
+                    frame,
+                    text,
+                    (pt[0] + 5, pt[1] - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.3,
+                    (255, 255, 255),
+                    1
+                )
+
+        return frame
+
+    def export_pose_data(self):
+        """Export pose data to JSON."""
+        if not self.processed_data:
+            messagebox.showwarning("Warning", "No data to export")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Save Pose Data",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+
+        if not file_path:
+            return
+
+        try:
+            import json
+
+            pose_data = {}
+            for data in self.processed_data:
+                if data.pose_keypoints and data.pose_metrics:
+                    pose_data[data.frame_number] = {
+                        'keypoints': data.pose_keypoints.keypoints.tolist(),
+                        'metrics': data.pose_metrics.to_dict()
+                    }
+
+            with open(file_path, 'w') as f:
+                json.dump(pose_data, f, indent=2)
+
+            messagebox.showinfo("Success", f"Pose data exported to {file_path}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Export failed: {e}")
+
     def display_frame(self, frame):
         """Display a frame in the video label."""
         # Convert BGR to RGB
@@ -1332,6 +1843,231 @@ class SpinTrackerGUI:
 
         except Exception as e:
             messagebox.showerror("Error", f"Export failed: {e}")
+
+    def load_professional_video(self):
+        """Load and process professional player video."""
+        player_name = self.pro_player_var.get()
+
+        if player_name == "Custom...":
+            # Let user select custom video
+            file_path = filedialog.askopenfilename(
+                title="Select Professional Player Video",
+                filetypes=[
+                    ("Video files", "*.mp4 *.avi *.mov *.mkv"),
+                    ("All files", "*.*")
+                ]
+            )
+
+            if not file_path:
+                return
+
+            # Ask for player name
+            from tkinter import simpledialog
+            player_name = simpledialog.askstring("Player Name", "Enter professional player name:")
+            if not player_name:
+                return
+        else:
+            # Check if cached
+            cached = self.pro_video_loader.get_cached_professional(player_name)
+            if cached:
+                self.professional_data = cached
+                messagebox.showinfo("Success", f"Loaded cached data for {player_name}")
+                return
+
+            # Need to load video
+            file_path = filedialog.askopenfilename(
+                title=f"Select {player_name} Video",
+                filetypes=[
+                    ("Video files", "*.mp4 *.avi *.mov *.mkv"),
+                    ("All files", "*.*")
+                ]
+            )
+
+            if not file_path:
+                return
+
+        # Process video
+        self.status_label.config(text=f"Processing {player_name} video...")
+        self.root.update()
+
+        try:
+            fps = float(self.fps_var.get())
+            self.professional_data = self.pro_video_loader.load_and_process(file_path, player_name, fps)
+            messagebox.showinfo("Success", f"Processed {len(self.professional_data['poses'])} poses for {player_name}")
+            self.status_label.config(text=f"Loaded {player_name} data")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to process video: {e}")
+            self.status_label.config(text="Ready")
+
+    def compare_with_professional(self):
+        """Compare amateur poses with professional."""
+        if not self.processed_data:
+            messagebox.showwarning("Warning", "Process your video first")
+            return
+
+        if not self.professional_data:
+            messagebox.showwarning("Warning", "Load professional video first")
+            return
+
+        self.status_label.config(text="Comparing poses...")
+        self.root.update()
+
+        try:
+            # Extract amateur poses with metrics
+            amateur_poses = []
+            for data in self.processed_data:
+                if data.pose_metrics:
+                    amateur_poses.append({
+                        'frame_idx': data.frame_number,
+                        'metrics': data.pose_metrics.to_dict()
+                    })
+
+            if not amateur_poses:
+                messagebox.showwarning("Warning", "No pose data found in your video")
+                return
+
+            # Get professional poses
+            pro_poses = self.professional_data['poses']
+            pro_metrics = self.professional_data['metrics']
+
+            # Combine poses with metrics
+            professional_poses = []
+            for i, pose in enumerate(pro_poses):
+                if i < len(pro_metrics):
+                    professional_poses.append({
+                        'frame_idx': pose['frame_idx'],
+                        'metrics': pro_metrics[i]
+                    })
+
+            # Calculate differences
+            avg_differences = self.pose_comparison.calculate_average_differences(amateur_poses, professional_poses)
+            improvement_areas = self.pose_comparison.identify_improvement_areas(avg_differences, top_n=5)
+
+            # Store results
+            self.comparison_results = {
+                'professional_player': self.professional_data['player_name'],
+                'avg_differences': avg_differences,
+                'improvement_areas': improvement_areas
+            }
+
+            # Display results
+            self.comparison_text.delete(1.0, tk.END)
+            self.comparison_text.insert(tk.END, f"Comparison with {self.professional_data['player_name']}\n")
+            self.comparison_text.insert(tk.END, "=" * 50 + "\n\n")
+
+            self.comparison_text.insert(tk.END, "Top Areas for Improvement:\n\n")
+            for i, area in enumerate(improvement_areas, 1):
+                self.comparison_text.insert(tk.END, f"{i}. {area['description']}\n\n")
+
+            self.comparison_text.insert(tk.END, "\nDetailed Metrics:\n")
+            self.comparison_text.insert(tk.END, "-" * 50 + "\n")
+            for key, value in avg_differences.items():
+                if 'avg_' in key:
+                    metric_name = key.replace('avg_', '').replace('_', ' ').title()
+                    self.comparison_text.insert(tk.END, f"{metric_name}: {value:.2f}\n")
+
+            self.status_label.config(text="Comparison complete")
+            messagebox.showinfo("Success", "Comparison complete! Check the Pro Comparison tab.")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Comparison failed: {e}")
+            self.status_label.config(text="Ready")
+
+    def generate_coaching_feedback(self):
+        """Generate AI coaching feedback."""
+        if not self.comparison_results:
+            messagebox.showwarning("Warning", "Run professional comparison first")
+            return
+
+        self.status_label.config(text="Generating coaching feedback...")
+        self.root.update()
+
+        try:
+            focus_areas = self.coaching_focus_var.get()
+            improvement_areas = self.comparison_results['improvement_areas']
+
+            feedback = self.gemini_coach.generate_feedback(
+                self.comparison_results['avg_differences'],
+                improvement_areas,
+                focus_areas
+            )
+
+            self.coaching_feedback = feedback
+
+            # Display feedback
+            self.coaching_text.delete(1.0, tk.END)
+            self.coaching_text.insert(tk.END, feedback)
+
+            self.status_label.config(text="Coaching feedback generated")
+            messagebox.showinfo("Success", "Coaching feedback generated! Check the AI Coaching tab.")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate feedback: {e}")
+            self.status_label.config(text="Ready")
+
+    def export_coaching_report(self):
+        """Export coaching report to file."""
+        if not self.coaching_feedback:
+            messagebox.showwarning("Warning", "Generate coaching feedback first")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Save Coaching Report",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w') as f:
+                f.write("Table Tennis Coaching Report\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Date: {Path(file_path).stem}\n")
+                f.write(f"Video: {self.video_path}\n\n")
+
+                if self.comparison_results:
+                    f.write(f"Compared with: {self.comparison_results['professional_player']}\n\n")
+
+                f.write(self.coaching_feedback)
+
+            messagebox.showinfo("Success", f"Report exported to {file_path}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Export failed: {e}")
+
+    def save_session(self):
+        """Save current training session."""
+        if not self.processed_data:
+            messagebox.showwarning("Warning", "No data to save")
+            return
+
+        try:
+            # Build session data
+            session_data = {
+                'video_path': self.video_path,
+                'ball_tracking': {
+                    'frames_analyzed': len(self.processed_data),
+                    'avg_spin': sum(d.rps for d in self.processed_data if d.rps) / len(self.processed_data) if self.processed_data else 0
+                },
+                'pose_tracking': {
+                    'poses_detected': sum(1 for d in self.processed_data if d.pose_keypoints)
+                }
+            }
+
+            if self.comparison_results:
+                session_data['comparison'] = self.comparison_results
+
+            if self.coaching_feedback:
+                session_data['coaching_feedback'] = self.coaching_feedback
+
+            # Save session
+            session_id = self.session_manager.save_session(session_data)
+            messagebox.showinfo("Success", f"Session saved: {session_id}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save session: {e}")
 
     def launch_frame_labeler(self):
         """Launch the frame labeling tool."""

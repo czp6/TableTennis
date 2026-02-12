@@ -31,6 +31,16 @@ try:
 except ImportError:
     HYBRID_AVAILABLE = False
 
+try:
+    from pose_detector import PoseDetector
+    from pose_detector_multi import MultiModelPoseDetector
+    from pose_metrics_calculator import PoseMetricsCalculator
+    from pose_tracker import TemporalPoseTracker
+    from pose_data import PoseKeypoints, PoseMetrics
+    POSE_AVAILABLE = True
+except ImportError:
+    POSE_AVAILABLE = False
+
 
 @dataclass
 class SpinData:
@@ -45,12 +55,14 @@ class SpinData:
     topspin_rps: float = 0.0  # positive = topspin, negative = backspin
     sidespin_rps: float = 0.0  # positive = right spin, negative = left spin
     direction: str = "none"  # overall direction description
+    pose_keypoints: Optional['PoseKeypoints'] = None  # Player pose data
+    pose_metrics: Optional['PoseMetrics'] = None  # Calculated pose metrics
 
 
 class SpinTracker:
     """Tracks table tennis ball spin rate from video."""
 
-    def __init__(self, video_path: str, fps: float = 240.0, rotate_90_cw: bool = False):
+    def __init__(self, video_path: str, fps: float = 240.0, rotate_90_cw: bool = False, process_mode: str = "all"):
         """
         Initialize the spin tracker.
 
@@ -58,10 +70,12 @@ class SpinTracker:
             video_path: Path to the video file
             fps: Frames per second of the video
             rotate_90_cw: Whether to rotate frames 90 degrees clockwise before processing
+            process_mode: Processing mode - "all", "ball", or "player"
         """
         self.video_path = video_path
         self.fps = fps
         self.rotate_90_cw = rotate_90_cw
+        self.process_mode = process_mode
 
         # Use hardware-accelerated video decoding on Mac
         self.cap = cv2.VideoCapture(video_path, cv2.CAP_AVFOUNDATION)
@@ -141,6 +155,49 @@ class SpinTracker:
         if ENHANCED_SEGMENTATION_AVAILABLE:
             self.color_segmenter = EnhancedColorSegmentation()
             print("Enhanced color segmentation enabled")
+
+        # Initialize pose detection
+        self.pose_detector = None
+        self.pose_metrics_calculator = None
+        self.pose_tracker = None
+        self.pose_trackers = []  # Multiple trackers for multi-person tracking
+        self.pose_enabled = True  # Can be toggled in GUI
+        self.track_multiple_people = False  # Track multiple people
+        self.pose_conf_threshold = 0.2  # Lowered from 0.25 for better continuity
+        self.pose_keypoint_conf_threshold = 0.25  # Lowered from 0.3
+        self.pose_data_history = []  # Store pose data for each frame
+        self.multi_pose_data_history = []  # Store multiple poses per frame
+
+        # Pose detection statistics
+        self.pose_detection_attempts = 0
+        self.pose_detection_successes = 0
+        self.pose_interpolated_frames = 0
+
+        if POSE_AVAILABLE and (process_mode == "all" or process_mode == "player"):
+            try:
+                # Try multi-model detector first for automatic fallback
+                try:
+                    self.pose_detector = MultiModelPoseDetector()
+                    if self.pose_detector.available:
+                        print(f"Pose detection enabled with multi-model support: {self.pose_detector.get_active_model_name()}")
+                    else:
+                        raise Exception("Multi-model detector not available")
+                except Exception:
+                    # Fallback to single model detector
+                    self.pose_detector = PoseDetector()
+                    print("Pose detection enabled with YOLOv8m-pose model")
+
+                self.pose_metrics_calculator = PoseMetricsCalculator()
+
+                # Initialize temporal tracker for smooth, continuous pose detection
+                # Increased smoothing and interpolation for smoother movement
+                self.pose_tracker = TemporalPoseTracker(
+                    smoothing_window=7,  # Increased from 5
+                    max_missing_frames=15  # Increased from 10
+                )
+                print("Temporal pose tracking enabled (enhanced smoothing + interpolation)")
+            except Exception as e:
+                print(f"Could not load pose detector: {e}")
 
     def detect_ball(self, frame: np.ndarray) -> Optional[Tuple[int, int, int]]:
         """
@@ -610,9 +667,128 @@ class SpinTracker:
 
         return (abs(total_rps), topspin_rps, sidespin_rps, direction)
 
+    def detect_player_pose(self, frame: np.ndarray, frame_number: int) -> Tuple[Optional['PoseKeypoints'], Optional['PoseMetrics']]:
+        """
+        Detect player pose(s) in frame with temporal smoothing and interpolation.
+
+        Args:
+            frame: Input frame
+            frame_number: Frame number
+
+        Returns:
+            Tuple of (PoseKeypoints, PoseMetrics) or (None, None) for single person
+            For multi-person mode, returns primary person's data
+        """
+        if not self.pose_enabled or not self.pose_detector or not self.pose_detector.available:
+            return None, None
+
+        # Track detection attempts
+        self.pose_detection_attempts += 1
+
+        timestamp = frame_number / self.fps
+
+        if self.track_multiple_people:
+            # Detect multiple people
+            detected_poses = self.pose_detector.detect_multiple(
+                frame,
+                conf_threshold=self.pose_conf_threshold,
+                keypoint_conf_threshold=self.pose_keypoint_conf_threshold,
+                max_people=3  # Track up to 3 people
+            )
+
+            # Track raw detection success
+            if len(detected_poses) > 0:
+                self.pose_detection_successes += 1
+
+            # Ensure we have enough trackers
+            while len(self.pose_trackers) < 3:
+                self.pose_trackers.append(TemporalPoseTracker(
+                    smoothing_window=7,
+                    max_missing_frames=15
+                ))
+
+            # Update each tracker
+            tracked_poses = []
+            for i in range(3):
+                detected = detected_poses[i] if i < len(detected_poses) else None
+                tracked = self.pose_trackers[i].update(detected, frame_number, timestamp)
+                if tracked is not None:
+                    tracked_poses.append(tracked)
+
+            # Track interpolated frames
+            if len(detected_poses) == 0 and len(tracked_poses) > 0:
+                self.pose_interpolated_frames += 1
+
+            # Store all poses
+            self.multi_pose_data_history.append(tracked_poses)
+
+            # Return primary person (first tracked pose)
+            if len(tracked_poses) > 0:
+                pose_keypoints = tracked_poses[0]
+                prev_pose = self.pose_data_history[-1] if self.pose_data_history else None
+                pose_metrics = None
+                if self.pose_metrics_calculator:
+                    pose_metrics = self.pose_metrics_calculator.calculate_metrics(pose_keypoints, prev_pose)
+                self.pose_data_history.append(pose_keypoints)
+                return pose_keypoints, pose_metrics
+            else:
+                return None, None
+
+        else:
+            # Single person detection (original logic)
+            detected_pose = self.pose_detector.detect(
+                frame,
+                conf_threshold=self.pose_conf_threshold,
+                keypoint_conf_threshold=self.pose_keypoint_conf_threshold
+            )
+
+            # Track raw detection success
+            if detected_pose is not None:
+                self.pose_detection_successes += 1
+
+            # Apply temporal tracking (smoothing + interpolation)
+            if self.pose_tracker:
+                pose_keypoints = self.pose_tracker.update(detected_pose, frame_number, timestamp)
+
+                # Track interpolated frames
+                if detected_pose is None and pose_keypoints is not None:
+                    self.pose_interpolated_frames += 1
+            else:
+                # No tracker - use raw detection
+                pose_keypoints = detected_pose
+                if pose_keypoints:
+                    pose_keypoints.frame_idx = frame_number
+                    pose_keypoints.timestamp = timestamp
+
+            # Log detection rate every 100 frames
+            if self.pose_detection_attempts % 100 == 0:
+                raw_rate = self.pose_detection_successes / self.pose_detection_attempts if self.pose_detection_attempts > 0 else 0
+                total_poses = self.pose_detection_successes + self.pose_interpolated_frames
+                effective_rate = total_poses / self.pose_detection_attempts if self.pose_detection_attempts > 0 else 0
+                tracking_quality = self.pose_tracker.get_tracking_quality() if self.pose_tracker else 0.0
+
+                print(f"Pose detection: {self.pose_detection_successes}/{self.pose_detection_attempts} raw ({raw_rate:.1%}), "
+                      f"{total_poses}/{self.pose_detection_attempts} effective ({effective_rate:.1%}), "
+                      f"quality: {tracking_quality:.1%}")
+
+            if pose_keypoints is None:
+                return None, None
+
+            # Calculate metrics
+            prev_pose = self.pose_data_history[-1] if self.pose_data_history else None
+            pose_metrics = None
+
+            if self.pose_metrics_calculator:
+                pose_metrics = self.pose_metrics_calculator.calculate_metrics(pose_keypoints, prev_pose)
+
+            # Store in history
+            self.pose_data_history.append(pose_keypoints)
+
+            return pose_keypoints, pose_metrics
+
     def process_frame(self, frame: np.ndarray, frame_number: int) -> Optional[SpinData]:
         """
-        Process a single frame to extract spin data.
+        Process a single frame to extract spin data and pose data.
 
         Args:
             frame: Input frame
@@ -625,6 +801,34 @@ class SpinTracker:
         if self.rotate_90_cw:
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
+        # Detect player pose (if enabled for this mode)
+        pose_keypoints, pose_metrics = None, None
+        if self.process_mode in ["all", "player"]:
+            pose_keypoints, pose_metrics = self.detect_player_pose(frame, frame_number)
+
+        # Skip ball detection if in player-only mode
+        if self.process_mode == "player":
+            # Return pose-only data
+            if pose_keypoints is not None:
+                spin_data = SpinData(
+                    frame_number=frame_number,
+                    rotation_angle=0.0,
+                    rps=0.0,
+                    ball_position=None,
+                    ball_radius=None,
+                    orange_centroid=None,
+                    white_centroid=None,
+                    topspin_rps=0.0,
+                    sidespin_rps=0.0,
+                    direction="none",
+                    pose_keypoints=pose_keypoints,
+                    pose_metrics=pose_metrics
+                )
+                self.spin_history.append(spin_data)
+                return spin_data
+            return None
+
+        # Detect ball (for "all" and "ball" modes)
         ball_pos = self.detect_ball(frame)
 
         if ball_pos is None:
@@ -655,7 +859,9 @@ class SpinTracker:
             white_centroid=None,  # Not used in new method
             topspin_rps=topspin_rps,
             sidespin_rps=sidespin_rps,
-            direction=direction
+            direction=direction,
+            pose_keypoints=pose_keypoints,
+            pose_metrics=pose_metrics
         )
 
         self.spin_history.append(spin_data)
